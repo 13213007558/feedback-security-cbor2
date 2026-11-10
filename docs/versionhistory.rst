@@ -5,6 +5,22 @@ Version history
 
 This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
+**UNRELEASED**
+
+- Fixed the pure Python decoder returning a mixed object graph when an ``object_hook`` or
+  ``tag_hook`` replaced a shared (tag 28) placeholder after a shared reference (tag 29) to
+  it had already been decoded. Such replacements now raise ``CBORDecodeError``; cyclic
+  structures require registering the final object up front via
+  ``CBORDecoder.set_shareable()`` (two-phase construction) or returning the original
+  object from the hook
+- Fixed shared references to a map used as a map key resolving to the mutable placeholder
+  dict instead of the resulting ``FrozenDict``, and rejected self-referencing mutable maps
+  in immutable (map key) context
+- Fixed shared reference decoding accepting negative or non-integer indices (negative
+  indices silently resolved to the wrong shared value)
+- Fixed decoder state (``fp``, stringref namespace) leaking into the next decode when a
+  hook raised an exception or decoding failed mid-stream
+
 **5.9.0** (2026-03-22)
 
 - Added the ``max_depth`` decoder parameter to limit the maximum allowed nesting level of

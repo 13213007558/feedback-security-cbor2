@@ -122,6 +122,19 @@ You could then verify that the cyclic references have been restored after deseri
     assert new_parent.children[0].parent is new_parent
     assert new_parent.children[1].parent is new_parent
 
+.. note::
+
+    A shared reference (tag 29) always resolves to the object registered for its
+    slot at the moment the reference is decoded. If an ``object_hook`` or
+    ``tag_hook`` later substitutes a *different* object for a slot whose reference
+    has already been decoded, the decoder raises :class:`CBORDecodeError` rather
+    than silently returning a graph where some references point at the discarded
+    placeholder. To support cyclic structures with custom types, either register
+    the final instance up front with :meth:`CBORDecoder.set_shareable` as shown
+    above (two-phase construction), or have the hook fill in and return the object
+    it was given. Hooks that replace the placeholder are still fine for
+    non-cyclic data: any references decoded afterwards resolve to the replacement.
+
 Decoding Tagged items as keys
 -----------------------------
 

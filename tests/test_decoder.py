@@ -1277,3 +1277,203 @@ def test_str_errors_long_string_invalid_middle(impl):
     assert result[65536] == "\ufffd"
     assert result[:65536] == "a" * 65536
     assert result[65537:] == "b" * 65536
+
+
+class TestSharedReferenceHooks:
+    """
+    Shared references (tags 28/29) must always resolve to the final object,
+    even when object_hook/tag_hook replace the decoded placeholder.
+    """
+
+    def test_object_hook_self_cycle_identity_preserved(self, impl):
+        # shareable({0: ref(0)}): a hook that returns the same (filled-in)
+        # object keeps the cyclic reference intact
+        hooked = []
+
+        def hook(decoder, value):
+            hooked.append(value)
+            return value
+
+        decoded = impl.loads(unhexlify("d81ca100d81d00"), object_hook=hook)
+        assert decoded[0] is decoded
+        assert hooked[0] is decoded
+
+    def test_object_hook_self_cycle_replacement_rejected(self, impl):
+        # The reference already resolved to the placeholder dict, so a hook
+        # that substitutes a different object must not silently produce a
+        # mixed graph
+        def hook(decoder, value):
+            return dict(value)
+
+        with pytest.raises(impl.CBORDecodeError, match="cannot be replaced"):
+            impl.loads(unhexlify("d81ca100d81d00"), object_hook=hook)
+
+    def test_tag_hook_self_cycle_replacement_rejected(self, impl):
+        # shareable(tag(11, [ref(0)])): the reference resolves to the CBORTag
+        # placeholder, so a tag_hook returning a different object is rejected
+        def hook(decoder, tag):
+            return ("unwrapped", tag.value)
+
+        with pytest.raises(impl.CBORDecodeError, match="cannot be replaced"):
+            impl.loads(unhexlify("d81cd80b81d81d00"), tag_hook=hook)
+
+    def test_tag_self_cycle_without_hook(self, impl):
+        decoded = impl.loads(unhexlify("d81cd80b81d81d00"))
+        assert isinstance(decoded, impl.CBORTag)
+        assert decoded.value[0] is decoded
+
+    def test_object_hook_shared_sibling_resolves_to_final_object(self, impl):
+        # [shareable({"a": 1}), ref(0)]: no cycle, so the hook product is
+        # registered before the reference is decoded
+        class Box:
+            def __init__(self, state):
+                self.state = state
+
+        decoded = impl.loads(
+            unhexlify("82d81ca1616101d81d00"),
+            object_hook=lambda decoder, value: Box(value),
+        )
+        assert isinstance(decoded[0], Box)
+        assert decoded[0] is decoded[1]
+        assert decoded[0].state == {"a": 1}
+
+    def test_object_hook_diamond_shared_map(self, impl):
+        # shareable([shareable({"a": 1}), ref(1), ref(1)]): all references
+        # point to the same hook product
+        class Box:
+            def __init__(self, state):
+                self.state = state
+
+        decoded = impl.loads(
+            unhexlify("d81c83d81ca1616101d81d01d81d01"),
+            object_hook=lambda decoder, value: Box(value),
+        )
+        assert isinstance(decoded[0], Box)
+        assert decoded[0] is decoded[1] is decoded[2]
+
+    @pytest.mark.parametrize("payload", ["d81d20", "d81d21"], ids=["minus_1", "minus_2"])
+    def test_sharedref_negative_index(self, impl, payload):
+        with pytest.raises(impl.CBORDecodeValueError, match="invalid shared reference index"):
+            impl.loads(unhexlify(payload))
+
+    def test_sharedref_non_integer_index(self, impl):
+        with pytest.raises(impl.CBORDecodeValueError, match="invalid shared reference index"):
+            impl.loads(unhexlify("d81d6161"))
+
+    def test_sharedref_forward_reference(self, impl):
+        # shareable([ref(1)]): index 1 does not exist yet
+        with pytest.raises(impl.CBORDecodeValueError, match="shared reference 1 not found"):
+            impl.loads(unhexlify("d81c81d81d01"))
+
+    def test_immutable_map_key_shares_frozen_dict(self, impl):
+        # {shareable({0: 1}): ref(0)}: the reference must resolve to the very
+        # FrozenDict used as the key, not the mutable placeholder
+        decoded = impl.loads(unhexlify("a1d81ca10001d81d00"))
+        ((key, value),) = decoded.items()
+        assert isinstance(key, FrozenDict)
+        assert value is key
+
+    def test_cyclic_map_as_key_rejected(self, impl):
+        # {shareable({0: ref(0)}): 1}: a mutable cyclic map cannot be used as
+        # a hash key, so the self-reference is never registered
+        with pytest.raises(
+            impl.CBORDecodeValueError, match="shared value 0 has not been initialized"
+        ):
+            impl.loads(unhexlify("a1d81ca100d81d0001"))
+
+    def test_success_failure_success_on_same_decoder(self, impl):
+        decoder = impl.CBORDecoder(BytesIO(b""))
+
+        decoder.fp = BytesIO(unhexlify("82d81ca1616101d81d00"))
+        first = decoder.decode()
+        assert first[0] is first[1]
+
+        # Failure after a shareable was registered (out-of-range reference)
+        decoder.fp = BytesIO(unhexlify("d81ca100d81d05"))
+        with pytest.raises(impl.CBORDecodeValueError, match="shared reference 5 not found"):
+            decoder.decode()
+
+        # The failed decode must not leak its shareables into the next one
+        decoder.fp = BytesIO(unhexlify("d81d00"))
+        with pytest.raises(impl.CBORDecodeValueError, match="shared reference 0 not found"):
+            decoder.decode()
+
+        decoder.fp = BytesIO(unhexlify("82d81ca1616101d81d00"))
+        second = decoder.decode()
+        assert second[0] is second[1]
+
+    def test_hook_exception_does_not_pollute_next_decode(self, impl):
+        def hook(decoder, value):
+            if "explode" in value:
+                raise RuntimeError("boom")
+            return value
+
+        decoder = impl.CBORDecoder(BytesIO(b""), object_hook=hook)
+        decoder.fp = BytesIO(unhexlify("d81ca1676578706c6f6465f5"))
+        with pytest.raises(RuntimeError, match="boom"):
+            decoder.decode()
+
+        decoder.fp = BytesIO(unhexlify("82d81ca1616101d81d00"))
+        result = decoder.decode()
+        assert result[0] is result[1]
+
+    def test_stringref_namespace_exception_does_not_pollute(self, impl):
+        decoder = impl.CBORDecoder(BytesIO(b""))
+        decoder.fp = BytesIO(unhexlify("d9010082656669727374d81903"))
+        with pytest.raises(impl.CBORDecodeValueError, match="string reference 3 not found"):
+            decoder.decode()
+
+        # The namespace must have been reset along with the failed decode
+        decoder.fp = BytesIO(unhexlify("d81900"))
+        with pytest.raises(
+            impl.CBORDecodeValueError, match="string reference outside of namespace"
+        ):
+            decoder.decode()
+
+
+def test_business_node_two_phase_construction(impl):
+    """
+    Small business-class example: a tag_hook registers the final instance up
+    front (two-phase construction), so cyclic and shared references all
+    resolve to the same object.
+    """
+
+    class Node:
+        def __init__(self, name):
+            self.name = name
+            self.links = []
+
+    @impl.shareable_encoder
+    def default(encoder, value):
+        state = encoder.encode_to_bytes({"name": value.name, "links": value.links})
+        encoder.encode(impl.CBORTag(3000, state))
+
+    def tag_hook(decoder, tag):
+        if tag.tag != 3000:
+            return tag
+
+        # Register the final instance before decoding the state that may
+        # contain references back to it
+        node = Node.__new__(Node)
+        decoder.set_shareable(node)
+        state = decoder.decode_from_bytes(tag.value)
+        node.name = state["name"]
+        node.links = state["links"]
+        return node
+
+    # Two-node cycle: a <-> b
+    a = Node("a")
+    b = Node("b")
+    a.links.append(b)
+    b.links.append(a)
+    payload = impl.dumps(a, default=default, value_sharing=True)
+    new_a = impl.loads(payload, tag_hook=tag_hook)
+    assert isinstance(new_a, Node)
+    assert new_a.links[0].name == "b"
+    assert new_a.links[0].links[0] is new_a
+
+    # Diamond sharing: both references point to the same instance
+    shared = Node("shared")
+    payload = impl.dumps([shared, shared], default=default, value_sharing=True)
+    decoded = impl.loads(payload, tag_hook=tag_hook)
+    assert decoded[0] is decoded[1]

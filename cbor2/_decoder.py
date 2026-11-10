@@ -54,6 +54,7 @@ class CBORDecoder:
         "_object_hook",
         "_share_index",
         "_shareables",
+        "_share_handed_out",
         "_fp",
         "_fp_read",
         "_immutable",
@@ -113,6 +114,7 @@ class CBORDecoder:
         self.str_errors = str_errors
         self._share_index: int | None = None
         self._shareables: list[object] = []
+        self._share_handed_out: set[int] = set()
         self._stringref_namespace: list[str | bytes] | None = None
         self._immutable = False
         self._max_depth = max_depth
@@ -185,10 +187,31 @@ class CBORDecoder:
         Set the shareable value for the last encountered shared value marker,
         if any. If the current shared index is ``None``, nothing is done.
 
+        A ``tag_hook`` can use this to register a not-yet-initialized instance
+        before decoding the state that may contain references to it, so that
+        cyclic references resolve to that very instance (two-phase
+        construction).
+
         :param value: the shared value
         :returns: the shared value to permit chaining
+        :raises CBORDecodeError:
+            if a shared reference (tag 29) to this slot has already been
+            decoded and ``value`` is not the object that reference resolved to
+
         """
         if self._share_index is not None:
+            if (
+                self._share_index in self._share_handed_out
+                and self._shareables[self._share_index] is not value
+            ):
+                raise CBORDecodeError(
+                    f"shared value {self._share_index} cannot be replaced with a "
+                    "different object: a reference to it has already been decoded. "
+                    "Register the final object up front with set_shareable() "
+                    "(two-phase construction) or return the original object from "
+                    "the hook"
+                )
+
             self._shareables[self._share_index] = value
 
         return value
@@ -259,6 +282,7 @@ class CBORDecoder:
             assert self._decode_depth >= 0
             if self._decode_depth == 0:
                 self._shareables.clear()
+                self._share_handed_out.clear()
                 self._share_index = None
 
     def decode_from_bytes(self, buf: bytes) -> object:
@@ -273,9 +297,10 @@ class CBORDecoder:
         with BytesIO(buf) as fp:
             old_fp = self.fp
             self.fp = fp
-            retval = self.decode()
-            self.fp = old_fp
-            return retval
+            try:
+                return self.decode()
+            finally:
+                self.fp = old_fp
 
     @overload
     def _decode_length(self, subtype: int) -> int: ...
@@ -455,7 +480,8 @@ class CBORDecoder:
         if length is None:
             # Indefinite length
             dictionary: dict[Any, Any] = {}
-            self.set_shareable(dictionary)
+            if not self._immutable:
+                self.set_shareable(dictionary)
             while True:
                 key = self.decode(immutable=True, unshared=True)
                 if key is break_marker:
@@ -464,7 +490,8 @@ class CBORDecoder:
                     dictionary[key] = self.decode(unshared=True)
         else:
             dictionary = {}
-            self.set_shareable(dictionary)
+            if not self._immutable:
+                self.set_shareable(dictionary)
             for _ in range(length):
                 key = self.decode(immutable=True, unshared=True)
                 dictionary[key] = self.decode(unshared=True)
@@ -474,7 +501,7 @@ class CBORDecoder:
             self.set_shareable(dictionary)
         elif self._immutable:
             frozen_dict = FrozenDict(dictionary)
-            self.set_shareable(dictionary)
+            self.set_shareable(frozen_dict)
             return frozen_dict
 
         return dictionary
@@ -641,6 +668,9 @@ class CBORDecoder:
     def decode_sharedref(self) -> Any:
         # Semantic tag 29
         value = self.decode(unshared=True)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise CBORDecodeValueError(f"invalid shared reference index {value!r}")
+
         try:
             shared = self._shareables[value]
         except IndexError:
@@ -648,8 +678,9 @@ class CBORDecoder:
 
         if shared is None:
             raise CBORDecodeValueError(f"shared value {value} has not been initialized")
-        else:
-            return shared
+
+        self._share_handed_out.add(value)
+        return shared
 
     def decode_complex(self) -> complex:
         # Semantic tag 43000
@@ -718,9 +749,10 @@ class CBORDecoder:
         # Semantic tag 256
         old_namespace = self._stringref_namespace
         self._stringref_namespace = []
-        value = self.decode()
-        self._stringref_namespace = old_namespace
-        return value
+        try:
+            return self.decode()
+        finally:
+            self._stringref_namespace = old_namespace
 
     def decode_set(self) -> set[Any] | frozenset[Any]:
         # Semantic tag 258
