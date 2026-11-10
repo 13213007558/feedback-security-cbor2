@@ -5,6 +5,18 @@ Version history
 
 This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
+**UNRELEASED**
+
+- Added an opt-in ``embedded_validation`` option to the pure Python decoder (``load``, ``loads``
+  and ``CBORDecoder``). When enabled, tag 24 (encoded CBOR data item) payloads are validated as
+  isolated embedded CBOR documents: the payload must be one byte string containing exactly one
+  complete CBOR data item (empty, truncated and trailing data are rejected), each document gets
+  its own shared-reference and string-reference namespace, and the caller's hooks and limits are
+  applied recursively. The new ``max_embedded_depth`` and ``max_embedded_bytes`` options bound the
+  total nesting depth and cumulative payload bytes across the whole decode. Validated documents
+  are returned as the new ``EmbeddedCBOR`` type, which retains the raw bytes alongside the decoded
+  value. The default behavior (tag 24 returned as an ordinary ``CBORTag``) is unchanged
+
 **5.9.0** (2026-03-22)
 
 - Added the ``max_depth`` decoder parameter to limit the maximum allowed nesting level of

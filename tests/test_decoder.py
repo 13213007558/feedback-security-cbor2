@@ -153,6 +153,231 @@ class TestMaximumDepth:
             impl.loads(b"\x81" * 10 + b"\x80", max_depth=9)
 
 
+def _tag24(payload: bytes) -> bytes:
+    """Wrap a (short) byte string as a definite-length tag 24 data item."""
+    assert len(payload) < 24
+    return b"\xd8\x18" + bytes([0x40 + len(payload)]) + payload
+
+
+class TestEmbeddedCBORValidation:
+    def test_disabled_preserves_tag24(self, impl) -> None:
+        # With the option off (the default), tag 24 is kept as an ordinary tag.
+        payload = unhexlify("83010203")  # embedded array [1, 2, 3]
+        assert impl.loads(_tag24(payload)) == impl.CBORTag(24, payload)
+
+    def test_disabled_keeps_invalid_payload_as_tag(self, impl) -> None:
+        # Even malformed embedded bytes are left untouched when validation is off.
+        assert impl.loads(_tag24(b"\x01\x02")) == impl.CBORTag(24, b"\x01\x02")
+
+    def test_enabled_returns_validated_value_with_raw_bytes(self, impl) -> None:
+        payload = unhexlify("83010203")
+        result = impl.loads(_tag24(payload), embedded_validation=True)
+        assert isinstance(result, impl.EmbeddedCBOR)
+        assert result.raw == payload
+        assert result.value == [1, 2, 3]
+
+    def test_two_level_nesting(self, impl) -> None:
+        result = impl.loads(_tag24(_tag24(b"\x07")), embedded_validation=True)
+        assert isinstance(result, impl.EmbeddedCBOR)
+        inner = result.value
+        assert isinstance(inner, impl.EmbeddedCBOR)
+        assert inner.raw == b"\x07"
+        assert inner.value == 7
+
+    def test_external_shared_reference_cannot_be_smuggled_in(self, impl) -> None:
+        # Outer document creates shared index 0 ("secret"); the embedded doc then
+        # tries to borrow it with tag 29(0). It must fail in an isolated namespace.
+        data = b"\x82" + unhexlify("d81c66736563726574") + _tag24(unhexlify("d81d00"))
+        with pytest.raises(impl.CBORDecodeError, match="nesting level 1.*shared reference 0"):
+            impl.loads(data, embedded_validation=True)
+
+    def test_external_string_reference_cannot_be_smuggled_in(self, impl) -> None:
+        # Outer string-reference namespace (tag 256) must not extend into the
+        # embedded document: a tag 25(0) inside it has no visible namespace.
+        data = (
+            unhexlify("d90100")  # tag 256, string reference namespace
+            + b"\x82"
+            + unhexlify("6568656c6c6f")  # "hello" -> string index 0
+            + _tag24(unhexlify("d81900"))  # embedded doc tries tag 25(0)
+        )
+        with pytest.raises(
+            impl.CBORDecodeError, match="nesting level 1.*string reference outside of namespace"
+        ):
+            impl.loads(data, embedded_validation=True)
+
+    def test_internal_same_number_reference_is_legal(self, impl) -> None:
+        # Index 0 created *inside* the embedded document resolves correctly there.
+        payload = unhexlify("82d81c65696e6e6572d81d00")  # [tag28("inner"), tag29(0)]
+        result = impl.loads(_tag24(payload), embedded_validation=True)
+        assert result.value == ["inner", "inner"]
+        assert result.value[0] is result.value[1]
+
+    def test_internal_index_does_not_leak_back_out(self, impl) -> None:
+        # The embedded document creates shared index 0; the outer document must
+        # not be able to resolve tag 29(0) against it afterwards.
+        data = b"\x82" + _tag24(unhexlify("d81c01")) + unhexlify("d81d00")
+        with pytest.raises(impl.CBORDecodeError, match="shared reference 0 not found"):
+            impl.loads(data, embedded_validation=True)
+
+    def test_outer_references_resume_after_embedded_document(self, impl) -> None:
+        # State must be restored: outer string refs and shared refs work both
+        # before and after an embedded document.
+        stringref_doc = (
+            unhexlify("d90100")
+            + b"\x83"
+            + unhexlify("6568656c6c6f")
+            + _tag24(b"\x01")
+            + unhexlify("d81900")
+        )
+        stringref_result = impl.loads(stringref_doc, embedded_validation=True)
+        assert stringref_result[0] == "hello"
+        assert isinstance(stringref_result[1], impl.EmbeddedCBOR)
+        assert stringref_result[2] == "hello"
+
+        shared_doc = (
+            b"\x83" + unhexlify("d81c656f75746572") + _tag24(b"\x01") + unhexlify("d81d00")
+        )
+        shared_result = impl.loads(shared_doc, embedded_validation=True)
+        assert shared_result[0] is shared_result[2] == "outer"
+
+    def test_empty_payload_rejected(self, impl) -> None:
+        with pytest.raises(impl.CBORDecodeValueError, match="nesting level 1.*empty payload"):
+            impl.loads(_tag24(b""), embedded_validation=True)
+
+    def test_truncated_payload_rejected(self, impl) -> None:
+        # Declares an array of two items but only provides one.
+        with pytest.raises(impl.CBORDecodeError, match="nesting level 1"):
+            impl.loads(_tag24(b"\x82\x01"), embedded_validation=True)
+
+    def test_trailing_second_data_item_rejected(self, impl) -> None:
+        with pytest.raises(
+            impl.CBORDecodeValueError, match="nesting level 1.*trailing byte"
+        ):
+            impl.loads(_tag24(b"\x01\x02"), embedded_validation=True)
+
+    def test_non_bytestring_payload_rejected(self, impl) -> None:
+        with pytest.raises(impl.CBORDecodeValueError, match="nesting level 1.*non-bytestring"):
+            impl.loads(unhexlify("d81801"), embedded_validation=True)
+
+    def test_indefinite_bytestring_payload_rejected(self, impl) -> None:
+        with pytest.raises(impl.CBORDecodeValueError, match="nesting level 1.*non-bytestring"):
+            impl.loads(b"\xd8\x18\x5f\x41\x01\xff", embedded_validation=True)
+
+    def test_error_identifies_inner_embedding_level(self, impl) -> None:
+        # A level-2 problem must be reported as level 2, wrapped by the level-1 doc.
+        with pytest.raises(
+            impl.CBORDecodeError,
+            match=(
+                r"invalid embedded CBOR document at nesting level 1: "
+                r"embedded CBOR document at nesting level 2.*trailing byte"
+            ),
+        ):
+            impl.loads(_tag24(_tag24(b"\x01\x02")), embedded_validation=True)
+
+        with pytest.raises(
+            impl.CBORDecodeError,
+            match=(
+                r"invalid embedded CBOR document at nesting level 1: "
+                r"embedded CBOR document at nesting level 2.*empty payload"
+            ),
+        ):
+            impl.loads(_tag24(_tag24(b"")), embedded_validation=True)
+
+    def test_max_embedded_depth_is_global(self, impl) -> None:
+        chain = b"\x07"
+        for _ in range(5):
+            chain = _tag24(chain)
+
+        with pytest.raises(impl.CBORDecodeError, match="nesting level 5.*maximum embedded depth"):
+            impl.loads(chain, embedded_validation=True)  # default limit is 4
+
+        result = impl.loads(chain, embedded_validation=True, max_embedded_depth=5)
+        for _ in range(5):
+            result = result.value
+        assert result == 7
+
+    def test_max_embedded_bytes_is_cumulative_across_levels(self, impl) -> None:
+        # Outer payload is 4 bytes (d8 18 41 07); inner payload is 1 byte (07).
+        two_level = _tag24(_tag24(b"\x07"))
+        with pytest.raises(impl.CBORDecodeError, match="nesting level 2.*embedded payload size"):
+            impl.loads(two_level, embedded_validation=True, max_embedded_bytes=4)
+
+        impl.loads(two_level, embedded_validation=True, max_embedded_bytes=5)
+
+    def test_max_embedded_bytes_is_cumulative_across_siblings(self, impl) -> None:
+        payload = b"\x4a" + b"\xaa" * 10  # one 10-byte bytestring (11 bytes on the wire)
+        siblings = b"\x83" + _tag24(payload) * 3
+        with pytest.raises(impl.CBORDecodeError, match="nesting level 1.*embedded payload size"):
+            impl.loads(siblings, embedded_validation=True, max_embedded_bytes=25)
+
+        result = impl.loads(siblings, embedded_validation=True, max_embedded_bytes=33)
+        assert all(item.value == b"\xaa" * 10 for item in result)
+
+    def test_max_depth_propagates_into_embedded_document(self, impl) -> None:
+        deep_array = b"\x81" * 6 + b"\x00"
+        with pytest.raises(impl.CBORDecodeError, match="maximum container nesting depth"):
+            impl.loads(_tag24(deep_array), embedded_validation=True, max_depth=5)
+
+    def test_tag_hook_recurses_into_embedded_document(self, impl) -> None:
+        def tag_hook(decoder, tag):
+            if tag.tag == 6000:
+                return "hooked:" + str(tag.value)
+            return tag
+
+        result = impl.loads(
+            _tag24(unhexlify("d9177001")), embedded_validation=True, tag_hook=tag_hook
+        )
+        assert result.value == "hooked:1"
+
+    def test_object_hook_and_str_errors_recurse(self, impl) -> None:
+        result = impl.loads(
+            _tag24(unhexlify("a10102")),
+            embedded_validation=True,
+            object_hook=lambda decoder, value: ("M", dict(value)),
+        )
+        assert result.value == ("M", {1: 2})
+
+        with pytest.raises(impl.CBORDecodeError, match="error decoding unicode string"):
+            impl.loads(_tag24(b"\x62\xff\xff"), embedded_validation=True)
+
+        replaced = impl.loads(
+            _tag24(b"\x62\xff\xff"), embedded_validation=True, str_errors="replace"
+        )
+        assert replaced.value == "��"
+
+    def test_stream_position_after_embedded_document(self, impl) -> None:
+        data = _tag24(b"\x01") + b"\x61\x78"  # embedded doc followed by text "x"
+        stream = BytesIO(data)
+        decoder = impl.CBORDecoder(stream, embedded_validation=True)
+        first = decoder.decode()
+        assert isinstance(first, impl.EmbeddedCBOR) and first.value == 1
+        assert decoder.decode() == "x"
+        assert stream.tell() == len(data)
+
+    def test_budgets_reset_between_top_level_decodes(self, impl) -> None:
+        # Each top-level decode() on a reused decoder gets fresh budgets, while
+        # a single decode still enforces one cumulative byte budget.
+        stream = BytesIO(_tag24(b"\x07") + _tag24(b"\x08"))
+        decoder = impl.CBORDecoder(stream, embedded_validation=True, max_embedded_bytes=1)
+        assert decoder.decode().value == 7
+        assert decoder.decode().value == 8
+
+        with pytest.raises(impl.CBORDecodeError, match="embedded payload size"):
+            impl.loads(
+                b"\x82" + _tag24(b"\x07") + _tag24(b"\x08"),
+                embedded_validation=True,
+                max_embedded_bytes=1,
+            )
+
+    def test_invalid_limit_values(self, impl) -> None:
+        for keyword in ("max_embedded_depth", "max_embedded_bytes"):
+            for value in (0, -1, True):
+                with pytest.raises(ValueError, match=keyword):
+                    impl.loads(
+                        b"\x01", embedded_validation=True, **{keyword: value}
+                    )
+
+
 @pytest.mark.parametrize(
     "payload, expected",
     [

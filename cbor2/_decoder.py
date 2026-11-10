@@ -15,6 +15,7 @@ from ._types import (
     CBORDecodeValueError,
     CBORSimpleValue,
     CBORTag,
+    EmbeddedCBOR,
     FrozenDict,
     break_marker,
     undefined,
@@ -61,6 +62,11 @@ class CBORDecoder:
         "_stringref_namespace",
         "_max_depth",
         "_decode_depth",
+        "_embedded_validation",
+        "_max_embedded_depth",
+        "_max_embedded_bytes",
+        "_embedded_depth",
+        "_embedded_bytes",
     )
 
     _fp: IO[bytes]
@@ -76,6 +82,9 @@ class CBORDecoder:
         read_size: int = 1,
         *,
         max_depth: int = 400,
+        embedded_validation: bool = False,
+        max_embedded_depth: int = 4,
+        max_embedded_bytes: int = 1024 * 1024,
     ):
         """
         :param fp:
@@ -103,6 +112,28 @@ class CBORDecoder:
             Ignored in the pure Python implementation, but included for API compatibility.
         :param max_depth:
             the maximum allowed container nesting depth
+        :param embedded_validation:
+            when ``True``, tag 24 payloads are validated as self-contained
+            embedded CBOR documents instead of being returned as ordinary
+            :class:`.CBORTag` objects. Each payload must be a byte string holding
+            exactly one complete CBOR data item (empty, truncated and trailing
+            data are all rejected). Embedded documents are decoded in a fresh
+            shared-reference and string-reference namespace, so neither outer
+            tag 29 / tag 25 references nor indexes created inside a document
+            can cross the boundary. The ``tag_hook``, ``object_hook``,
+            ``str_errors`` and ``max_depth`` settings are applied recursively.
+            Successful validation yields an :class:`.EmbeddedCBOR` (raw bytes
+            plus the decoded value); a parsed document is not treated as a
+            signature that has been verified
+        :param max_embedded_depth:
+            the maximum number of tag 24 documents that may be nested (each one
+            embedded in the previous one) across the whole decode. The budget is
+            global, not replenished when entering a new document
+        :param max_embedded_bytes:
+            the cumulative maximum number of tag 24 payload bytes that may be
+            processed across the whole decode (nested payloads count toward the
+            same total). The budget is global, not replenished when entering a new
+            document
 
         .. _Error Handlers: https://docs.python.org/3/library/codecs.html#error-handlers
 
@@ -117,6 +148,11 @@ class CBORDecoder:
         self._immutable = False
         self._max_depth = max_depth
         self._decode_depth = 0
+        self.embedded_validation = embedded_validation
+        self.max_embedded_depth = max_embedded_depth
+        self.max_embedded_bytes = max_embedded_bytes
+        self._embedded_depth = 0
+        self._embedded_bytes = 0
 
     @property
     def immutable(self) -> bool:
@@ -179,6 +215,36 @@ class CBORDecoder:
                 f"invalid str_errors value {value!r} (must be 'strict', 'error', 'replace', "
                 f"'backslashreplace' or 'surrogateescape')"
             )
+
+    @property
+    def embedded_validation(self) -> bool:
+        return self._embedded_validation
+
+    @embedded_validation.setter
+    def embedded_validation(self, value: bool) -> None:
+        self._embedded_validation = bool(value)
+
+    @property
+    def max_embedded_depth(self) -> int:
+        return self._max_embedded_depth
+
+    @max_embedded_depth.setter
+    def max_embedded_depth(self, value: int) -> None:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError("max_embedded_depth must be a positive integer")
+
+        self._max_embedded_depth = value
+
+    @property
+    def max_embedded_bytes(self) -> int:
+        return self._max_embedded_bytes
+
+    @max_embedded_bytes.setter
+    def max_embedded_bytes(self, value: int) -> None:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError("max_embedded_bytes must be a positive integer")
+
+        self._max_embedded_bytes = value
 
     def set_shareable(self, value: T) -> T:
         """
@@ -260,6 +326,9 @@ class CBORDecoder:
             if self._decode_depth == 0:
                 self._shareables.clear()
                 self._share_index = None
+                # A new top-level document gets fresh embedded-document budgets
+                self._embedded_depth = 0
+                self._embedded_bytes = 0
 
     def decode_from_bytes(self, buf: bytes) -> object:
         """
@@ -482,7 +551,9 @@ class CBORDecoder:
     def decode_semantic(self, subtype: int) -> Any:
         # Major tag 6
         tagnum = self._decode_length(subtype)
-        if semantic_decoder := semantic_decoders.get(tagnum):
+        if tagnum == 24 and self._embedded_validation:
+            return self.decode_embedded_cbor()
+        elif semantic_decoder := semantic_decoders.get(tagnum):
             return semantic_decoder(self)
 
         tag = CBORTag(tagnum, None)
@@ -492,6 +563,78 @@ class CBORDecoder:
             tag = self._tag_hook(self, tag)
 
         return self.set_shareable(tag)
+
+    def decode_embedded_cbor(self) -> EmbeddedCBOR:
+        # Semantic tag 24 (encoded CBOR data item), validated as an isolated
+        # embedded document. Only reachable when embedded_validation is enabled.
+        level = self._embedded_depth + 1
+        if level > self._max_embedded_depth:
+            raise CBORDecodeError(
+                f"embedded CBOR document at nesting level {level} exceeds maximum embedded "
+                f"depth ({self._max_embedded_depth})"
+            )
+
+        # Read the payload directly, as a single definite-length bytestring, so
+        # it is neither registered in the outer string-reference namespace nor
+        # marked as an outer shareable value.
+        payload_subtype = self.read(1)[0]
+        if payload_subtype >> 5 != 2 or (payload_subtype & 31) == 31:
+            raise CBORDecodeValueError(
+                f"embedded CBOR document at nesting level {level} has a non-bytestring tag 24 "
+                "payload"
+            )
+
+        payload_length = self._decode_length(payload_subtype & 31)
+        if payload_length > sys.maxsize:
+            raise CBORDecodeValueError(
+                f"invalid length for embedded CBOR payload 0x{payload_length:x}"
+            )
+
+        payload = self.read(payload_length)
+        if payload_length == 0:
+            raise CBORDecodeValueError(
+                f"embedded CBOR document at nesting level {level} has an empty payload"
+            )
+        elif self._embedded_bytes + payload_length > self._max_embedded_bytes:
+            raise CBORDecodeError(
+                f"embedded CBOR document at nesting level {level} exceeds maximum cumulative "
+                f"embedded payload size ({self._max_embedded_bytes} bytes)"
+            )
+
+        self._embedded_depth = level
+        self._embedded_bytes += payload_length
+        old_fp = self._fp
+        old_share_index = self._share_index
+        old_shareables = self._shareables
+        old_namespace = self._stringref_namespace
+        try:
+            with BytesIO(payload) as embedded_fp:
+                self.fp = embedded_fp
+                self._share_index = None
+                self._shareables = []
+                self._stringref_namespace = None
+                try:
+                    value = self.decode()
+                except CBORDecodeError as exc:
+                    raise CBORDecodeError(
+                        f"invalid embedded CBOR document at nesting level {level}: {exc}"
+                    ) from exc
+
+                leftover = embedded_fp.read()
+
+            if leftover:
+                raise CBORDecodeValueError(
+                    f"embedded CBOR document at nesting level {level} contains {len(leftover)} "
+                    "trailing byte(s) after the first complete CBOR data item"
+                )
+        finally:
+            self.fp = old_fp
+            self._share_index = old_share_index
+            self._shareables = old_shareables
+            self._stringref_namespace = old_namespace
+            self._embedded_depth -= 1
+
+        return self.set_shareable(EmbeddedCBOR(payload, value))
 
     def decode_special(self, subtype: int) -> Any:
         # Simple value
@@ -836,6 +979,9 @@ def loads(
     read_size: int = 1,
     *,
     max_depth: int = 400,
+    embedded_validation: bool = False,
+    max_embedded_depth: int = 4,
+    max_embedded_bytes: int = 1024 * 1024,
 ) -> Any:
     """
     Deserialize an object from a bytestring.
@@ -860,6 +1006,15 @@ def loads(
         Ignored in the pure Python implementation, but included for API compatibility.
     :param max_depth:
         the maximum allowed container nesting depth
+    :param embedded_validation:
+        when ``True``, validate tag 24 payloads as isolated embedded CBOR documents
+        (see :class:`CBORDecoder` for the exact rules) and return them as
+        :class:`.EmbeddedCBOR` objects
+    :param max_embedded_depth:
+        the maximum number of nested tag 24 documents across the whole decode
+    :param max_embedded_bytes:
+        the cumulative maximum number of tag 24 payload bytes processed across the
+        whole decode
     :return:
         the deserialized object
 
@@ -874,6 +1029,9 @@ def loads(
             str_errors=str_errors,
             read_size=read_size,
             max_depth=max_depth,
+            embedded_validation=embedded_validation,
+            max_embedded_depth=max_embedded_depth,
+            max_embedded_bytes=max_embedded_bytes,
         ).decode()
 
 
@@ -885,6 +1043,9 @@ def load(
     read_size: int = 1,
     *,
     max_depth: int = 400,
+    embedded_validation: bool = False,
+    max_embedded_depth: int = 4,
+    max_embedded_bytes: int = 1024 * 1024,
 ) -> Any:
     """
     Deserialize an object from an open file.
@@ -912,6 +1073,15 @@ def load(
         Ignored in the pure Python implementation, but included for API compatibility.
     :param max_depth:
         the maximum allowed container nesting depth
+    :param embedded_validation:
+        when ``True``, validate tag 24 payloads as isolated embedded CBOR documents
+        (see :class:`CBORDecoder` for the exact rules) and return them as
+        :class:`.EmbeddedCBOR` objects
+    :param max_embedded_depth:
+        the maximum number of nested tag 24 documents across the whole decode
+    :param max_embedded_bytes:
+        the cumulative maximum number of tag 24 payload bytes processed across the
+        whole decode
     :return:
         the deserialized object
 
@@ -925,4 +1095,7 @@ def load(
         str_errors=str_errors,
         read_size=read_size,
         max_depth=max_depth,
+        embedded_validation=embedded_validation,
+        max_embedded_depth=max_embedded_depth,
+        max_embedded_bytes=max_embedded_bytes,
     ).decode()

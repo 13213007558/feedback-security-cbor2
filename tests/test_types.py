@@ -94,6 +94,27 @@ def test_tag_repr(impl):
     assert repr(impl.CBORTag(600, "blah")) == "CBORTag(600, 'blah')"
 
 
+def test_embedded_cbor_attr(impl):
+    embedded = impl.EmbeddedCBOR(b"\x01", 1)
+    assert embedded.raw == b"\x01"
+    assert embedded.value == 1
+
+
+def test_embedded_cbor_compare(impl):
+    first = impl.EmbeddedCBOR(b"\x01", 1)
+    second = impl.EmbeddedCBOR(b"\x01", 1)
+    different_value = impl.EmbeddedCBOR(b"\x02", 2)
+    assert first is not second
+    assert first == second
+    assert first != different_value
+    assert not (first == (b"\x01", 1))
+    assert first != (b"\x01", 1)
+
+
+def test_embedded_cbor_repr(impl):
+    assert repr(impl.EmbeddedCBOR(b"\x01", 1)) == "EmbeddedCBOR(b'\\x01', 1)"
+
+
 def test_simple_value_repr(impl):
     assert repr(impl.CBORSimpleValue(1)) == "CBORSimpleValue(value=1)"
 

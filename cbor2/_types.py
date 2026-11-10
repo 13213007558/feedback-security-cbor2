@@ -95,6 +95,37 @@ class CBORTag:
                 del thread_locals.running_hashes
 
 
+class EmbeddedCBOR:
+    """
+    Represents a validated CBOR document embedded in a tag 24 (encoded CBOR
+    data item).
+
+    The raw payload bytes are retained alongside the value decoded from them.
+    A successfully constructed object only means that the bytes contain a
+    single, complete CBOR data item that was parsed in an isolated reference
+    namespace; it does **not** establish any protocol-level signature or
+    authenticity of the content.
+
+    :param bytes raw: the exact bytes carried by the tag 24 payload
+    :param value: the value decoded from ``raw``
+    """
+
+    __slots__ = "raw", "value"
+
+    def __init__(self, raw: bytes, value: Any) -> None:
+        self.raw = raw
+        self.value = value
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, EmbeddedCBOR):
+            return (self.raw, self.value) == (other.raw, other.value)
+
+        return NotImplemented
+
+    def __repr__(self) -> str:
+        return f"EmbeddedCBOR({self.raw!r}, {self.value!r})"
+
+
 class CBORSimpleValue(namedtuple("CBORSimpleValue", ["value"])):
     """
     Represents a CBOR "simple value".

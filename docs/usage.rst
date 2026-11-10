@@ -126,6 +126,48 @@ a :class:`CBORTag` object like so::
 
 This will be ignored on decode and the original data content will be returned.
 
+Embedded CBOR documents (tag 24)
+---------------------------------
+
+Some protocols carry a second, self-contained CBOR document inside a CBOR byte string using
+`tag 24 (encoded CBOR data item)`_. By default such a tag is decoded like any other tag, leaving
+the raw byte string untouched::
+
+    >>> loads(bytes.fromhex("d8184101"))
+    CBORTag(24, b'\\x01')
+
+When the bytes come from an untrusted peer you can opt in to validating them by passing
+``embedded_validation=True`` to :func:`load`, :func:`loads` or :class:`CBORDecoder`::
+
+    >>> from cbor2 import EmbeddedCBOR
+    >>> loads(bytes.fromhex("d8184101"), embedded_validation=True)
+    EmbeddedCBOR(b'\\x01', 1)
+
+With validation enabled, every tag 24 payload must be a single definite-length byte string that
+contains exactly one complete CBOR data item. Empty payloads, truncated data and any trailing
+bytes after the first data item are rejected, and the error message identifies the nesting level
+of the offending document.
+
+Each embedded document is decoded in a fresh reference namespace:
+
+* outer shared references (tags 28/29) and string references (tags 25/256) cannot be borrowed
+  inside an embedded document, and
+* indexes created inside an embedded document do not leak back into the enclosing document.
+
+The caller's ``tag_hook``, ``object_hook``, ``str_errors`` and ``max_depth`` settings are applied
+recursively to embedded documents. Two global budgets protect the whole decode and are not
+replenished when entering a new document:
+
+* ``max_embedded_depth`` limits how many tag 24 documents may be nested inside one another, and
+* ``max_embedded_bytes`` limits the cumulative number of tag 24 payload bytes processed (payloads
+  of nested and sibling documents all count toward the same total).
+
+A successful result is an :class:`EmbeddedCBOR` that retains the original payload bytes alongside
+the decoded value. Note that this only means the bytes form a single, well-formed CBOR data item;
+parsing is not a cryptographic signature check and must not be treated as proof of authenticity.
+
+.. _tag 24 (encoded CBOR data item): https://www.rfc-editor.org/rfc/rfc8949.html#name-encoded-cbor-data-item
+
 Use Cases
 ---------
 

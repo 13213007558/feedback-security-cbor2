@@ -16,6 +16,7 @@ from ._types import CBOREncodeValueError as CBOREncodeValueError
 from ._types import CBORError as CBORError
 from ._types import CBORSimpleValue as CBORSimpleValue
 from ._types import CBORTag as CBORTag
+from ._types import EmbeddedCBOR as EmbeddedCBOR
 from ._types import FrozenDict as FrozenDict
 from ._types import undefined as undefined
 
