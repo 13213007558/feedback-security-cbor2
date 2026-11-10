@@ -21,6 +21,8 @@ Types
 
 .. autoclass:: cbor2.CBORSimpleValue
 .. autoclass:: cbor2.CBORTag
+.. autoclass:: cbor2.CBORMap
+.. autoclass:: cbor2.MapConflict
 .. data:: cbor2.undefined
     A singleton representing the CBOR "undefined" value.
 
@@ -34,3 +36,4 @@ Exceptions
 .. autoexception:: cbor2.CBORDecodeError
 .. autoexception:: cbor2.CBORDecodeValueError
 .. autoexception:: cbor2.CBORDecodeEOF
+.. autoexception:: cbor2.CBORMapConflictError

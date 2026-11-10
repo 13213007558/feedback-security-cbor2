@@ -13,6 +13,7 @@ from ._types import (
     CBORDecodeEOF,
     CBORDecodeError,
     CBORDecodeValueError,
+    CBORMap,
     CBORSimpleValue,
     CBORTag,
     FrozenDict,
@@ -61,6 +62,7 @@ class CBORDecoder:
         "_stringref_namespace",
         "_max_depth",
         "_decode_depth",
+        "_map_representation",
     )
 
     _fp: IO[bytes]
@@ -71,11 +73,12 @@ class CBORDecoder:
         self,
         fp: IO[bytes],
         tag_hook: Callable[[CBORDecoder, CBORTag], Any] | None = None,
-        object_hook: Callable[[CBORDecoder, dict[Any, Any]], Any] | None = None,
+        object_hook: Callable[[CBORDecoder, dict[Any, Any] | CBORMap], Any] | None = None,
         str_errors: str = "strict",
         read_size: int = 1,
         *,
         max_depth: int = 400,
+        map_representation: Literal["dict", "lossless"] = "dict",
     ):
         """
         :param fp:
@@ -89,8 +92,9 @@ class CBORDecoder:
         :param object_hook:
             callable that takes 2 arguments: the decoder instance, and a
             dictionary. This callback is invoked for each deserialized
-            :class:`dict` object. The return value is substituted for the dict in
-            the deserialized output.
+            :class:`dict` object, or for each :class:`.CBORMap` when
+            ``map_representation="lossless"`` is used. The return value is
+            substituted for the mapping in the deserialized output.
         :param str_errors:
             determines how to handle unicode decoding errors (see the `Error Handlers`_
             section in the standard library documentation for details)
@@ -103,6 +107,13 @@ class CBORDecoder:
             Ignored in the pure Python implementation, but included for API compatibility.
         :param max_depth:
             the maximum allowed container nesting depth
+        :param map_representation:
+            controls how CBOR maps are represented in the decoded output. With
+            the default ``"dict"``, maps are decoded into Python :class:`dict`
+            objects, so duplicate or type-colliding keys collapse and unhashable
+            (compound) keys raise an error. With ``"lossless"``, every map is
+            decoded into a :class:`.CBORMap` that preserves entry order,
+            duplicate entries and the CBOR type of each key
 
         .. _Error Handlers: https://docs.python.org/3/library/codecs.html#error-handlers
 
@@ -111,6 +122,7 @@ class CBORDecoder:
         self.tag_hook = tag_hook
         self.object_hook = object_hook
         self.str_errors = str_errors
+        self.map_representation = map_representation
         self._share_index: int | None = None
         self._shareables: list[object] = []
         self._stringref_namespace: list[str | bytes] | None = None
@@ -154,15 +166,31 @@ class CBORDecoder:
             raise ValueError("tag_hook must be None or a callable")
 
     @property
-    def object_hook(self) -> Callable[[CBORDecoder, dict[Any, Any]], Any] | None:
+    def object_hook(self) -> Callable[[CBORDecoder, dict[Any, Any] | CBORMap], Any] | None:
         return self._object_hook
 
     @object_hook.setter
-    def object_hook(self, value: Callable[[CBORDecoder, dict[Any, Any]], Any] | None) -> None:
+    def object_hook(
+        self, value: Callable[[CBORDecoder, dict[Any, Any] | CBORMap], Any] | None
+    ) -> None:
         if value is None or callable(value):
             self._object_hook = value
         else:
             raise ValueError("object_hook must be None or a callable")
+
+    @property
+    def map_representation(self) -> Literal["dict", "lossless"]:
+        return self._map_representation
+
+    @map_representation.setter
+    def map_representation(self, value: Literal["dict", "lossless"]) -> None:
+        if value not in ("dict", "lossless"):
+            raise ValueError(
+                f"invalid map_representation value {value!r} "
+                "(must be 'dict' or 'lossless')"
+            )
+
+        self._map_representation = value
 
     @property
     def str_errors(self) -> str:
@@ -452,6 +480,9 @@ class CBORDecoder:
     def decode_map(self, subtype: int) -> Mapping[Any, Any]:
         # Major tag 5
         length = self._decode_length(subtype, allow_indefinite=True)
+        if self._map_representation == "lossless":
+            return self._decode_lossless_map(length)
+
         if length is None:
             # Indefinite length
             dictionary: dict[Any, Any] = {}
@@ -478,6 +509,31 @@ class CBORDecoder:
             return frozen_dict
 
         return dictionary
+
+    def _decode_lossless_map(self, length: int | None) -> Any:
+        # Keys are decoded without the immutable flag so that compound keys
+        # (arrays, nested maps) keep their full structure instead of being
+        # forced into hashable types.
+        mapping = CBORMap()
+        self.set_shareable(mapping)
+        if length is None:
+            # Indefinite length
+            while True:
+                key = self.decode(unshared=True)
+                if key is break_marker:
+                    break
+                else:
+                    mapping.add(key, self.decode(unshared=True))
+        else:
+            for _ in range(length):
+                key = self.decode(unshared=True)
+                mapping.add(key, self.decode(unshared=True))
+
+        if self._object_hook:
+            mapping = self._object_hook(self, mapping)
+            self.set_shareable(mapping)
+
+        return mapping
 
     def decode_semantic(self, subtype: int) -> Any:
         # Major tag 6
@@ -831,11 +887,12 @@ semantic_decoders: dict[int, Callable[[CBORDecoder], Any]] = {
 def loads(
     s: bytes | bytearray | memoryview,
     tag_hook: Callable[[CBORDecoder, CBORTag], Any] | None = None,
-    object_hook: Callable[[CBORDecoder, dict[Any, Any]], Any] | None = None,
+    object_hook: Callable[[CBORDecoder, dict[Any, Any] | CBORMap], Any] | None = None,
     str_errors: Literal["strict", "error", "replace"] = "strict",
     read_size: int = 1,
     *,
     max_depth: int = 400,
+    map_representation: Literal["dict", "lossless"] = "dict",
 ) -> Any:
     """
     Deserialize an object from a bytestring.
@@ -849,8 +906,9 @@ def loads(
         object in the deserialized output
     :param object_hook:
         callable that takes 2 arguments: the decoder instance, and a dictionary. This
-        callback is invoked for each deserialized :class:`dict` object. The return value
-        is substituted for the dict in the deserialized output.
+        callback is invoked for each deserialized :class:`dict` object, or for each
+        :class:`.CBORMap` when ``map_representation="lossless"`` is used. The return
+        value is substituted for the mapping in the deserialized output
     :param str_errors:
         determines how to handle unicode decoding errors (see the `Error Handlers`_
         section in the standard library documentation for details)
@@ -860,6 +918,12 @@ def loads(
         Ignored in the pure Python implementation, but included for API compatibility.
     :param max_depth:
         the maximum allowed container nesting depth
+    :param map_representation:
+        controls how CBOR maps are represented. The default ``"dict"`` produces
+        ordinary :class:`dict` objects (duplicate or type-colliding keys
+        collapse, and unhashable keys raise an error). ``"lossless"`` produces
+        :class:`.CBORMap` objects that preserve every entry and the CBOR type
+        of each key
     :return:
         the deserialized object
 
@@ -874,17 +938,19 @@ def loads(
             str_errors=str_errors,
             read_size=read_size,
             max_depth=max_depth,
+            map_representation=map_representation,
         ).decode()
 
 
 def load(
     fp: IO[bytes],
     tag_hook: Callable[[CBORDecoder, CBORTag], Any] | None = None,
-    object_hook: Callable[[CBORDecoder, dict[Any, Any]], Any] | None = None,
+    object_hook: Callable[[CBORDecoder, dict[Any, Any] | CBORMap], Any] | None = None,
     str_errors: Literal["strict", "error", "replace"] = "strict",
     read_size: int = 1,
     *,
     max_depth: int = 400,
+    map_representation: Literal["dict", "lossless"] = "dict",
 ) -> Any:
     """
     Deserialize an object from an open file.
@@ -898,8 +964,9 @@ def load(
         object in the deserialized output
     :param object_hook:
         callable that takes 2 arguments: the decoder instance, and a dictionary. This
-        callback is invoked for each deserialized :class:`dict` object. The return value
-        is substituted for the dict in the deserialized output.
+        callback is invoked for each deserialized :class:`dict` object, or for each
+        :class:`.CBORMap` when ``map_representation="lossless"`` is used. The return
+        value is substituted for the mapping in the deserialized output.
     :param str_errors:
         determines how to handle unicode decoding errors (see the `Error Handlers`_
         section in the standard library documentation for details)
@@ -912,6 +979,12 @@ def load(
         Ignored in the pure Python implementation, but included for API compatibility.
     :param max_depth:
         the maximum allowed container nesting depth
+    :param map_representation:
+        controls how CBOR maps are represented. The default ``"dict"`` produces
+        ordinary :class:`dict` objects (duplicate or type-colliding keys
+        collapse, and unhashable keys raise an error). ``"lossless"`` produces
+        :class:`.CBORMap` objects that preserve every entry and the CBOR type
+        of each key
     :return:
         the deserialized object
 
@@ -925,4 +998,5 @@ def load(
         str_errors=str_errors,
         read_size=read_size,
         max_depth=max_depth,
+        map_representation=map_representation,
     ).decode()

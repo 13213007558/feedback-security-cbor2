@@ -5,6 +5,21 @@ Version history
 
 This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
+**UNRELEASED**
+
+- Added a lossless representation for CBOR maps in the pure Python decoder. Passing
+  ``map_representation="lossless"`` to :func:`~cbor2.load`, :func:`~cbor2.loads` or
+  :class:`~cbor2.CBORDecoder` decodes every map into a :class:`~cbor2.CBORMap` that preserves
+  entry order, duplicate entries, the CBOR types of keys (so ``true``, ``1`` and ``1.0`` stay
+  distinct) and compound keys such as arrays or nested maps. Nested maps and shared references
+  use the same representation, and :class:`~cbor2.CBORMap` values can be re-encoded directly
+- Added :meth:`CBORMap.dict_conflicts() <cbor2.CBORMap.dict_conflicts>`,
+  :attr:`CBORMap.dict_compatible <cbor2.CBORMap.dict_compatible>` and
+  :meth:`CBORMap.to_dict() <cbor2.CBORMap.to_dict>` together with the :class:`~cbor2.MapConflict`
+  record and :exc:`~cbor2.CBORMapConflictError` exception, so audit consumers can tell exactly
+  why a map cannot be represented as an ordinary :class:`dict` instead of having entries
+  silently overwritten. The default ``dict`` representation is unchanged
+
 **5.9.0** (2026-03-22)
 
 - Added the ``max_depth`` decoder parameter to limit the maximum allowed nesting level of

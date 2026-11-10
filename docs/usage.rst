@@ -74,6 +74,55 @@ instead encodes a reference to the nth sufficiently long string already encoded.
 .. warning:: Support for string referencing is rare in other CBOR implementations, so think carefully
     whether you want to enable it.
 
+Lossless map handling
+---------------------
+
+A CBOR map is not exactly the same thing as a Python :class:`dict`. CBOR maps may contain
+duplicate keys, keys that compare equal but have different CBOR types (for example ``true``,
+``1`` and ``1.0`` all compare equal in Python), and even compound keys (arrays or nested maps)
+that cannot be used as Python dict keys at all. Decoding such a map into a plain :class:`dict`
+silently merges or drops the affected entries.
+
+By default, :func:`load` and :func:`loads` keep the historical behavior and produce
+:class:`dict` objects. Pass ``map_representation="lossless"`` to decode every map into a
+:class:`CBORMap` instead::
+
+    from cbor2 import CBORMap, loads
+
+    # {"a": 1, "a": 2}
+    decoded = loads(bytes.fromhex("a2616101616102"), map_representation="lossless")
+    assert isinstance(decoded, CBORMap)
+    assert decoded.entries == (("a", 1), ("a", 2))
+
+:class:`CBORMap` preserves the order and CBOR type of every entry, including duplicates and
+compound keys, and nested maps use the same representation. Shared references keep referring to
+the same object. It implements the read-only :class:`~collections.abc.Mapping` interface, so
+``mapping[key]`` and ``"key" in mapping`` work as usual (returning the first matching value),
+while :attr:`~CBORMap.entries`, :meth:`~CBORMap.items` and :meth:`~CBORMap.values` expose every
+entry, duplicates included.
+
+A :class:`CBORMap` can be fed straight back to :func:`dump`/:func:`dumps` to reproduce the
+original map entries without any data loss.
+
+When an ``object_hook`` is used, the hook receives a :class:`CBORMap` in lossless mode and a
+plain :class:`dict` in the default mode, so it always knows which representation it is dealing
+with.
+
+To find out whether a lossless map is safe to materialize as a plain :class:`dict`, use the
+audit-oriented helpers:
+
+* :attr:`CBORMap.dict_compatible` answers the question directly,
+* :meth:`CBORMap.dict_conflicts` returns a :class:`MapConflict` record for every entry that
+  would be merged or dropped (including entries inside nested maps), and
+* :meth:`CBORMap.to_dict` performs a recursive conversion but raises
+  :exc:`CBORMapConflictError` instead of silently overwriting anything::
+
+    if decoded.dict_compatible:
+        plain = decoded.to_dict()
+    else:
+        for conflict in decoded.dict_conflicts():
+            print(conflict.reason, conflict.path, conflict.key)
+
 Performance tuning
 ------------------
 

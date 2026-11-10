@@ -16,6 +16,7 @@ from typing import IO, TYPE_CHECKING, Any, cast
 from ._types import (
     CBOREncodeTypeError,
     CBOREncodeValueError,
+    CBORMap,
     CBORSimpleValue,
     CBORTag,
     FrozenDict,
@@ -717,6 +718,7 @@ default_encoders: dict[type | tuple[str, str], Callable[[CBOREncoder, Any], None
     defaultdict: CBOREncoder.encode_map,
     OrderedDict: CBOREncoder.encode_map,
     FrozenDict: CBOREncoder.encode_map,
+    CBORMap: CBOREncoder.encode_map,
     type(undefined): CBOREncoder.encode_undefined,
     datetime: CBOREncoder.encode_datetime,
     date: CBOREncoder.encode_date,
@@ -741,6 +743,7 @@ canonical_encoders: dict[type | tuple[str, str], Callable[[CBOREncoder, Any], No
     defaultdict: CBOREncoder.encode_canonical_map,
     OrderedDict: CBOREncoder.encode_canonical_map,
     FrozenDict: CBOREncoder.encode_canonical_map,
+    CBORMap: CBOREncoder.encode_canonical_map,
     set: CBOREncoder.encode_canonical_set,
     frozenset: CBOREncoder.encode_canonical_set,
 }
