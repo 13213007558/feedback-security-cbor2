@@ -1,6 +1,10 @@
 from typing import Any
 
 from ._decoder import CBORDecoder as CBORDecoder
+from ._decoder import TAG_ALLOW as TAG_ALLOW
+from ._decoder import TAG_PRESERVE as TAG_PRESERVE
+from ._decoder import TAG_REJECT as TAG_REJECT
+from ._decoder import TagPolicy as TagPolicy
 from ._decoder import load as load
 from ._decoder import loads as loads
 from ._encoder import CBOREncoder as CBOREncoder

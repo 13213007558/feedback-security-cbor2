@@ -5,6 +5,19 @@ Version history
 
 This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
+**UNRELEASED**
+
+- Added an explicit, pure-Python semantic tag admission policy (``tag_policy``) to
+  :class:`~cbor2.CBORDecoder`, :func:`~cbor2.loads` and :func:`~cbor2.load`. A
+  :class:`~cbor2.TagPolicy`, a ``{tag: action}`` mapping or a callable lets the caller allow,
+  preserve (as a raw :class:`~cbor2.CBORTag`) or reject each tag before the built-in semantic
+  conversion runs, so rejected dates, big numbers, decimals, sets and custom tags never trigger
+  their semantic constructors or ``tag_hook``. Structural tags 25, 28, 29 and 256 must be
+  explicitly allowed or rejected, and policy failures leave no stale shared/string reference
+  state. :meth:`TagPolicy.safe` provides a preset that only admits basic data and the
+  self-describe tag (55799) while unknown tags are retained as data. The default behavior
+  (``tag_policy=None``) is unchanged
+
 **5.9.0** (2026-03-22)
 
 - Added the ``max_depth`` decoder parameter to limit the maximum allowed nesting level of

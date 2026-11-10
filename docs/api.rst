@@ -15,6 +15,11 @@ Decoding
 .. autofunction:: cbor2.loads
 .. autofunction:: cbor2.load
 .. autoclass:: cbor2.CBORDecoder
+.. autoclass:: cbor2.TagPolicy
+    :members:
+.. data:: cbor2.TAG_ALLOW
+.. data:: cbor2.TAG_PRESERVE
+.. data:: cbor2.TAG_REJECT
 
 Types
 -----

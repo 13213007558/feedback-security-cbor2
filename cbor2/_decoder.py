@@ -34,6 +34,146 @@ timestamp_re = re.compile(
 )
 incremental_utf8_decoder = getincrementaldecoder("utf-8")
 
+#: Interpret the tag with its built-in semantic decoder (or via ``tag_hook``
+#: when no built-in decoder exists).
+TAG_ALLOW = "allow"
+#: Keep the tag as a :class:`~cbor2.CBORTag` value. The payload is still fully
+#: decoded, with nested tags subject to the same policy.
+TAG_PRESERVE = "preserve"
+#: Refuse the tag by raising :class:`~cbor2.CBORDecodeError` before any
+#: semantic object is constructed.
+TAG_REJECT = "reject"
+
+#: Structural tags that mutate the decoder's reference machinery. They can
+#: only be explicitly allowed or rejected; preserving them as an opaque shell
+#: would leave later references pointing at the wrong objects.
+STRUCTURAL_TAGS = frozenset({25, 28, 29, 256})
+
+TagAction = Literal["allow", "preserve", "reject"]
+
+
+class TagPolicy:
+    """
+    Explicit admission policy for CBOR semantic tags (major type 6).
+
+    The policy is consulted for every tag *before* its built-in semantic
+    decoder runs, so a rejected tag never triggers construction of the
+    potentially expensive semantic object (``datetime``, ``Decimal``,
+    ``set``, ...) and unknown tags never reach an unauthorized custom
+    handler.
+
+    Three actions are available per tag:
+
+    * :data:`TAG_ALLOW` – normal interpretation, including ``tag_hook`` for
+      tags without a built-in decoder
+    * :data:`TAG_PRESERVE` – keep the raw :class:`~cbor2.CBORTag`; the
+      payload is still decoded and nested tags stay subject to the policy
+    * :data:`TAG_REJECT` – raise :class:`~cbor2.CBORDecodeError`
+
+    A plain mapping of tag numbers to actions may be passed instead of a
+    :class:`TagPolicy`; tags missing from the mapping then default to
+    :data:`TAG_PRESERVE`. A callable taking the tag number and returning an
+    action is also accepted.
+
+    Structural tags 25 (string reference), 28 (shareable), 29 (shared
+    reference) and 256 (string reference namespace) can only be allowed or
+    rejected – they cannot be preserved.
+    """
+
+    __slots__ = ("rules", "default_action")
+
+    def __init__(
+        self,
+        rules: Mapping[int, TagAction] | None = None,
+        default_action: TagAction = TAG_PRESERVE,
+    ):
+        """
+        :param rules: mapping of tag numbers to actions
+        :param default_action:
+            action applied to any tag that does not appear in ``rules``
+        """
+        self.rules: dict[int, TagAction] = {}
+        if rules:
+            for tagnum, action in rules.items():
+                self._validate_tag(tagnum)
+                self._validate_action(action)
+                if tagnum in STRUCTURAL_TAGS and action == TAG_PRESERVE:
+                    raise ValueError(
+                        f"structural tag {tagnum} cannot be preserved; it must be explicitly "
+                        "allowed or rejected"
+                    )
+
+                self.rules[tagnum] = action
+
+        self._validate_action(default_action)
+        self.default_action = default_action
+
+    @staticmethod
+    def _validate_tag(tagnum: Any) -> None:
+        if isinstance(tagnum, bool) or not isinstance(tagnum, int) or tagnum not in range(2**64):
+            raise ValueError("tag numbers must be non-negative integers less than 2**64")
+
+    @staticmethod
+    def _validate_action(action: Any) -> None:
+        if action not in (TAG_ALLOW, TAG_PRESERVE, TAG_REJECT):
+            raise ValueError(
+                f"invalid tag action {action!r} (must be {TAG_ALLOW!r}, {TAG_PRESERVE!r} or "
+                f"{TAG_REJECT!r})"
+            )
+
+    def decide(self, tagnum: int) -> TagAction:
+        """Return the action that applies to ``tagnum``."""
+        action = self.rules.get(tagnum, self.default_action)
+        if action == TAG_PRESERVE and tagnum in STRUCTURAL_TAGS:
+            raise CBORDecodeError(
+                f"structural tag {tagnum} has no explicit policy; it must be allowed or "
+                "rejected, not preserved"
+            )
+
+        return action
+
+    @classmethod
+    def safe(cls) -> "TagPolicy":
+        """
+        A conservative preset that only admits basic CBOR data plus the
+        self-describe CBOR tag (55799, which is a transparent wrapper).
+
+        The structural tags (25, 28, 29, 256) are rejected explicitly, and
+        every other tag is preserved as a :class:`~cbor2.CBORTag` so that
+        unknown tags survive as data instead of triggering a semantic
+        conversion or a custom handler.
+        """
+        return cls(
+            {
+                25: TAG_REJECT,
+                28: TAG_REJECT,
+                29: TAG_REJECT,
+                256: TAG_REJECT,
+                55799: TAG_ALLOW,
+            },
+            default_action=TAG_PRESERVE,
+        )
+
+
+TagPolicyInput = TagPolicy | Callable[[int], TagAction] | Mapping[int, TagAction] | None
+
+
+def _coerce_tag_policy(
+    tag_policy: TagPolicyInput,
+) -> TagPolicy | Callable[[int], TagAction] | None:
+    if tag_policy is None or isinstance(tag_policy, TagPolicy):
+        return tag_policy
+    elif callable(tag_policy):
+        # A user supplied decision function taking the tag number.
+        return tag_policy
+    elif isinstance(tag_policy, Mapping):
+        return TagPolicy(tag_policy)
+    else:
+        raise ValueError(
+            "tag_policy must be a TagPolicy, a mapping of tag numbers to actions, a callable "
+            "or None"
+        )
+
 
 class CBORDecoder:
     """
@@ -52,6 +192,7 @@ class CBORDecoder:
     __slots__ = (
         "_tag_hook",
         "_object_hook",
+        "_tag_policy",
         "_share_index",
         "_shareables",
         "_fp",
@@ -76,6 +217,7 @@ class CBORDecoder:
         read_size: int = 1,
         *,
         max_depth: int = 400,
+        tag_policy: TagPolicyInput = None,
     ):
         """
         :param fp:
@@ -103,6 +245,12 @@ class CBORDecoder:
             Ignored in the pure Python implementation, but included for API compatibility.
         :param max_depth:
             the maximum allowed container nesting depth
+        :param tag_policy:
+            an explicit admission policy for semantic tags. A :class:`TagPolicy`,
+            a mapping of tag numbers to actions (``"allow"``, ``"preserve"`` or
+            ``"reject"``) or a callable taking a tag number and returning an
+            action. When ``None`` (the default), all built-in semantic tags keep
+            their default behavior and unknown tags are passed to ``tag_hook``
 
         .. _Error Handlers: https://docs.python.org/3/library/codecs.html#error-handlers
 
@@ -110,6 +258,7 @@ class CBORDecoder:
         self.fp = fp
         self.tag_hook = tag_hook
         self.object_hook = object_hook
+        self.tag_policy = tag_policy
         self.str_errors = str_errors
         self._share_index: int | None = None
         self._shareables: list[object] = []
@@ -163,6 +312,19 @@ class CBORDecoder:
             self._object_hook = value
         else:
             raise ValueError("object_hook must be None or a callable")
+
+    @property
+    def tag_policy(
+        self,
+    ) -> TagPolicy | Callable[[int], TagAction] | None:
+        return self._tag_policy
+
+    @tag_policy.setter
+    def tag_policy(
+        self,
+        value: TagPolicyInput,
+    ) -> None:
+        self._tag_policy = _coerce_tag_policy(value)
 
     @property
     def str_errors(self) -> str:
@@ -482,6 +644,25 @@ class CBORDecoder:
     def decode_semantic(self, subtype: int) -> Any:
         # Major tag 6
         tagnum = self._decode_length(subtype)
+        tag_policy = self._tag_policy
+        if tag_policy is not None:
+            # The admission decision is made here, before any built-in
+            # semantic object is constructed.
+            action = tag_policy(tagnum) if callable(tag_policy) else tag_policy.decide(tagnum)
+            if action == TAG_REJECT:
+                raise CBORDecodeError(f"semantic tag {tagnum} is not permitted by the tag policy")
+            elif action == TAG_PRESERVE:
+                # Keep the raw tag, but fully decode the payload (with nested
+                # tags still subject to the policy) instead of skipping it.
+                tag = CBORTag(tagnum, None)
+                self.set_shareable(tag)
+                tag.value = self.decode(unshared=True)
+                return self.set_shareable(tag)
+            elif action != TAG_ALLOW:
+                raise CBORDecodeError(
+                    f"tag policy returned invalid action {action!r} for tag {tagnum}"
+                )
+
         if semantic_decoder := semantic_decoders.get(tagnum):
             return semantic_decoder(self)
 
@@ -718,9 +899,13 @@ class CBORDecoder:
         # Semantic tag 256
         old_namespace = self._stringref_namespace
         self._stringref_namespace = []
-        value = self.decode()
-        self._stringref_namespace = old_namespace
-        return value
+        try:
+            return self.decode()
+        finally:
+            # Restore the enclosing namespace even if the payload was
+            # rejected by the tag policy, so a reused decoder never keeps a
+            # namespace it no longer owns.
+            self._stringref_namespace = old_namespace
 
     def decode_set(self) -> set[Any] | frozenset[Any]:
         # Semantic tag 258
@@ -836,6 +1021,7 @@ def loads(
     read_size: int = 1,
     *,
     max_depth: int = 400,
+    tag_policy: TagPolicyInput = None,
 ) -> Any:
     """
     Deserialize an object from a bytestring.
@@ -860,6 +1046,10 @@ def loads(
         Ignored in the pure Python implementation, but included for API compatibility.
     :param max_depth:
         the maximum allowed container nesting depth
+    :param tag_policy:
+        an explicit admission policy for semantic tags (a :class:`TagPolicy`,
+        a mapping of tag numbers to actions or a callable). When ``None``,
+        the default semantic tag behavior is used
     :return:
         the deserialized object
 
@@ -874,6 +1064,7 @@ def loads(
             str_errors=str_errors,
             read_size=read_size,
             max_depth=max_depth,
+            tag_policy=tag_policy,
         ).decode()
 
 
@@ -885,6 +1076,7 @@ def load(
     read_size: int = 1,
     *,
     max_depth: int = 400,
+    tag_policy: TagPolicyInput = None,
 ) -> Any:
     """
     Deserialize an object from an open file.
@@ -912,6 +1104,10 @@ def load(
         Ignored in the pure Python implementation, but included for API compatibility.
     :param max_depth:
         the maximum allowed container nesting depth
+    :param tag_policy:
+        an explicit admission policy for semantic tags (a :class:`TagPolicy`,
+        a mapping of tag numbers to actions or a callable). When ``None``,
+        the default semantic tag behavior is used
     :return:
         the deserialized object
 
@@ -925,4 +1121,5 @@ def load(
         str_errors=str_errors,
         read_size=read_size,
         max_depth=max_depth,
+        tag_policy=tag_policy,
     ).decode()

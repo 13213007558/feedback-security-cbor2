@@ -58,6 +58,56 @@ The same could be done with ``object_hook``, except less efficiently::
 You should make sure that whatever way you decide to use for telling apart your "specially marked"
 dicts from arbitrary data dicts won't mistake on for the other.
 
+Explicit tag admission policies
+-------------------------------
+
+``tag_hook`` only sees tags that have no built-in decoder: tags such as ``0``/``1`` (dates),
+``2``/``3`` (big numbers), ``4``/``5`` (decimals) or ``258`` (sets) are converted into Python
+objects automatically, before any hook runs. When decoding CBOR from an untrusted source you may
+want to decide per tag whether it is interpreted, kept as raw data or refused altogether. The
+pure Python decoder accepts a ``tag_policy`` for this::
+
+    from cbor2 import loads, TagPolicy, TAG_ALLOW, TAG_PRESERVE, TAG_REJECT
+
+    policy = TagPolicy(
+        {
+            0: TAG_ALLOW,      # interpret datetime strings
+            1: TAG_REJECT,     # refuse epoch datetimes (no datetime object is built)
+            258: TAG_PRESERVE, # keep the raw CBORTag instead of building a set
+        },
+        default_action=TAG_PRESERVE,
+    )
+
+The three actions are:
+
+* ``TAG_ALLOW`` – run the normal built-in decoder, or invoke ``tag_hook`` when no built-in decoder
+  exists for the tag
+* ``TAG_PRESERVE`` – keep a :class:`CBORTag` whose payload is still fully decoded (nested tags
+  remain subject to the same policy)
+* ``TAG_REJECT`` – raise :class:`CBORDecodeError` before any semantic object is constructed
+
+The decision is made before the built-in semantic conversion runs, so a rejected date, decimal or
+big number never triggers the corresponding constructor. Preserved tags still parse their complete
+payload and remain usable (and hashable) as map keys. A plain ``{tag: action}`` mapping or a
+callable ``tag_number -> action`` can be passed in place of a :class:`TagPolicy`; a bare mapping
+defaults to ``TAG_PRESERVE`` for tags it does not mention.
+
+The structural tags 25 (string reference), 28 (shareable), 29 (shared reference) and 256 (string
+reference namespace) change how later values in the stream are resolved, so they cannot be
+preserved as an empty shell. They must be explicitly allowed or rejected; otherwise a
+:class:`CBORDecodeError` is raised. If a policy rejection aborts a decode, the decoder's shared
+value and string reference registries are restored to their enclosing state.
+
+A ready-made conservative configuration is available through :meth:`TagPolicy.safe`. It admits
+only basic CBOR data and the self-describe tag (55799), explicitly rejects the structural tags, and
+preserves every other tag – including unknown ones – as data instead of invoking a custom handler::
+
+    >>> loads(unhexlify('d917706548656c6c6f'), tag_policy=TagPolicy.safe())
+    CBORTag(6000, 'Hello')
+
+When ``tag_policy`` is not given (the default), every built-in semantic tag keeps its historical
+behavior and unknown tags are still passed to ``tag_hook``.
+
 Value sharing with custom types
 -------------------------------
 
